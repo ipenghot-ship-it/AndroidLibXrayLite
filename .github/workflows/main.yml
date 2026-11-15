@@ -72,4 +72,4 @@ jobs:
         file: ./libv2ray*r
         tag: ${{ github.event.inputs.release_tag }}
         file_glob: true
-        overwrite_files: true
+        overwrite: true
