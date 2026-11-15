@@ -175,20 +175,6 @@ func measureInstDelay(ctx context.Context, inst *core.Instance, url string) (int
 	return minDuration, nil
 }
 
-// SpeedResult carries the outcome of a throughput measurement back to the
-// JVM through gomobile. Bytes is the number of payload bytes actually read
-// from the response body; ElapsedMs is the wall-clock time of that download.
-//
-// Failure encoding (mirrors the Kotlin-side sentinels):
-//   - Bytes == 0, ElapsedMs == -1: the node could not be reached at all
-//     (config load, instance start, dial, TLS, or HTTP status failure).
-//   - Bytes > 0, ElapsedMs == -1: the node was reachable and some bytes were
-//     transferred, but the download did not complete (timeout / reset).
-type SpeedResult struct {
-	Bytes     int64
-	ElapsedMs int64
-}
-
 // MeasureOutboundThroughput downloads the file at url through a throwaway core
 // instance built from ConfigureFileContent and reports how many bytes were
 // transferred and how long the transfer took. The body is counted, never
@@ -197,10 +183,29 @@ type SpeedResult struct {
 // Unlike MeasureOutboundDelay (a latency probe with a hard 12s budget), the
 // download is given up to 5 minutes so that large files on slow nodes complete
 // instead of tripping a timeout and reporting a false failure.
-func MeasureOutboundThroughput(ConfigureFileContent string, url string) (SpeedResult, error) {
+//
+// Return encoding (a single int64 so gomobile can bind it — it drops functions
+// returning custom structs):
+//   - -1: the node could not be reached at all (config load, instance start,
+//     dial, TLS, HTTP status failure, or empty body).
+//   - -2: the node was reachable and some bytes were transferred, but the
+//     download did not complete (timeout / connection reset).
+//   - otherwise: (bytes << 20) | elapsedMs. elapsedMs occupies the low 20 bits
+//     (max ~17 minutes, well above the 5-minute budget); bytes is the payload
+//     byte count actually read.
+func MeasureOutboundThroughput(ConfigureFileContent string, url string) (int64, error) {
+	const (
+		resultConnectFailed = int64(-1)
+		resultSpeedFailed   = int64(-2)
+		elapsedBits         = 20
+	)
+	pack := func(bytes, elapsedMs int64) int64 {
+		return (bytes << elapsedBits) | elapsedMs
+	}
+
 	config, err := coreserial.LoadJSONConfig(strings.NewReader(ConfigureFileContent))
 	if err != nil {
-		return SpeedResult{Bytes: 0, ElapsedMs: -1}, fmt.Errorf("config load error: %w", err)
+		return resultConnectFailed, fmt.Errorf("config load error: %w", err)
 	}
 
 	config.Inbound = nil
@@ -216,10 +221,10 @@ func MeasureOutboundThroughput(ConfigureFileContent string, url string) (SpeedRe
 
 	inst, err := core.New(config)
 	if err != nil {
-		return SpeedResult{Bytes: 0, ElapsedMs: -1}, fmt.Errorf("instance creation failed: %w", err)
+		return resultConnectFailed, fmt.Errorf("instance creation failed: %w", err)
 	}
 	if err := inst.Start(); err != nil {
-		return SpeedResult{Bytes: 0, ElapsedMs: -1}, fmt.Errorf("startup failed: %w", err)
+		return resultConnectFailed, fmt.Errorf("startup failed: %w", err)
 	}
 	defer inst.Close()
 
@@ -251,19 +256,19 @@ func MeasureOutboundThroughput(ConfigureFileContent string, url string) (SpeedRe
 
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
-		return SpeedResult{Bytes: 0, ElapsedMs: -1}, fmt.Errorf("failed to create HTTP request: %w", err)
+		return resultConnectFailed, fmt.Errorf("failed to create HTTP request: %w", err)
 	}
 
 	start := time.Now()
 	resp, err := client.Do(req)
 	if err != nil {
 		// Never reached a usable response: treat as unreachable.
-		return SpeedResult{Bytes: 0, ElapsedMs: -1}, fmt.Errorf("request failed: %w", err)
+		return resultConnectFailed, fmt.Errorf("request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
-		return SpeedResult{Bytes: 0, ElapsedMs: -1}, fmt.Errorf("invalid status: %s", resp.Status)
+		return resultConnectFailed, fmt.Errorf("invalid status: %s", resp.Status)
 	}
 
 	// Count payload bytes without buffering the whole file or touching disk.
@@ -278,14 +283,17 @@ func MeasureOutboundThroughput(ConfigureFileContent string, url string) (SpeedRe
 			if readErr == io.EOF {
 				break
 			}
-			// Partial transfer: node was reachable, report what we got as failed.
-			return SpeedResult{Bytes: downloaded, ElapsedMs: -1}, fmt.Errorf("download interrupted: %w", readErr)
+			// Partial transfer: node was reachable but download did not finish.
+			if downloaded <= 0 {
+				return resultConnectFailed, fmt.Errorf("download interrupted: %w", readErr)
+			}
+			return resultSpeedFailed, fmt.Errorf("download interrupted: %w", readErr)
 		}
 	}
 
 	elapsed := time.Since(start).Milliseconds()
 	if downloaded <= 0 {
-		return SpeedResult{Bytes: 0, ElapsedMs: -1}, fmt.Errorf("empty response body")
+		return resultConnectFailed, fmt.Errorf("empty response body")
 	}
-	return SpeedResult{Bytes: downloaded, ElapsedMs: elapsed}, nil
+	return pack(downloaded, elapsed), nil
 }
